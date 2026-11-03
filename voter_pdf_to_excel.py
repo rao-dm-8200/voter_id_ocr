@@ -289,12 +289,22 @@ def extract_pdf(client, types, args, pdf):
         wait = min_gap - (time.time() - _last_call[0])
         if wait > 0: time.sleep(wait)
         _last_call[0] = time.time()
-        try:
-            res = read_page(client, types, args, img, is_last=(n == total))
-        except QuotaExhausted:
-            raise
-        except Exception as e:  # noqa
-            print(f"   FAILED page {n}: {str(e)[:120]} (will retry on next run)", flush=True)
+        res = None
+        while True:
+            try:
+                res = read_page(client, types, args, img, is_last=(n == total))
+                break
+            except QuotaExhausted:
+                models = [m.strip() for m in args.model_list.split(",") if m.strip()]
+                nxt = models.index(args.model) + 1 if args.model in models else len(models)
+                if nxt >= len(models):
+                    raise                      # every model is out of quota
+                print(f"   quota of {args.model} is over -> switching to {models[nxt]}", flush=True)
+                args.model = models[nxt]
+            except Exception as e:  # noqa
+                print(f"   FAILED page {n}: {str(e)[:120]} (will retry on next run)", flush=True)
+                break
+        if res is None:
             continue
         res["cache_version"] = CACHE_VERSION
         json.dump(res, open(cache_path(args.cache, pdf, n), "w", encoding="utf-8"), ensure_ascii=False)
@@ -399,7 +409,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", nargs="?", default="", help="PDF file or folder of PDFs")
     ap.add_argument("output", nargs="?", default="", help="folder for the Excel files (one per PDF, same name as the PDF)")
-    ap.add_argument("--model", default="gemini-3.5-flash-lite")
+    ap.add_argument("--model", default="gemini-3.5-flash-lite", help="one model, or several separated by commas: when one runs out of quota the next is used")
     ap.add_argument("--rpm", type=float, default=10, help="requests per minute limit")
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--fallback-model", default="", help="stronger model used only to re-read pages with bad letters, e.g. gemini-3.5-flash")
@@ -410,6 +420,8 @@ if __name__ == "__main__":
     ap.add_argument("--build-only", action="store_true")
     ap.add_argument("--list-models", action="store_true", help="show models your key can use, then exit")
     a = ap.parse_args()
+    a.model_list = a.model                       # "modelA,modelB,modelC" = try in this order
+    a.model = a.model.split(",")[0].strip()
     if a.list_models:
         from google import genai
         c = genai.Client(api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
