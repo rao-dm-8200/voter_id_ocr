@@ -121,18 +121,64 @@ class QuotaExhausted(Exception):
     pass
 
 
+def parse_json_text(text):
+    """Pull the JSON object out of a model reply (handles ```json fences and extra words)."""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    i, j = text.find("{"), text.rfind("}")
+    d = json.loads(text[i:j + 1])
+    d.setdefault("vibhag_line", "")
+    d.setdefault("voters", [])
+    for v in d["voters"]:
+        for k, default in (("card_vibhag_no", ""), ("epic", ""), ("name", ""), ("relation_type", ""), ("relative_name", ""),
+                           ("house_no", ""), ("gender", ""), ("age", 0), ("serial", 0)):
+            v.setdefault(k, default)
+        for k in ("age", "serial"):
+            try: v[k] = int(normalize_digits(str(v[k])))
+            except ValueError: v[k] = 0
+    return d
+
+
+def call_ollama(model, images, temperature=0.0):
+    """Local model through Ollama (http://localhost:11434). model like 'ollama:gemma3:12b'."""
+    import base64, urllib.request
+    body = {"model": model.split(":", 1)[1], "stream": False, "format": SCHEMA,
+            "options": {"temperature": temperature, "num_ctx": 8192},
+            "messages": [{"role": "user", "content": PROMPT,
+                          "images": [base64.b64encode(b).decode() for b in images]}]}
+    req = urllib.request.Request(os.environ.get("OLLAMA_URL", "http://localhost:11434") + "/api/chat",
+                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            text = json.loads(r.read().decode())["message"]["content"]
+    except OSError as e:
+        sys.exit(f"Cannot reach Ollama at localhost:11434 ({e}). Install/start Ollama and run: ollama pull {model.split(':', 1)[1]}")
+    return parse_json_text(text)
+
+
 def call_gemini(client, types, model, images, temperature=0.0, max_retries=6):
+    if model.startswith("ollama:"):
+        return call_ollama(model, images, temperature)
     parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in images]
-    cfg = types.GenerateContentConfig(
-        response_mime_type="application/json", response_schema=SCHEMA, temperature=temperature)
+    gemma = model.lower().startswith("gemma")
+    if gemma:   # Gemma models: no JSON-schema mode, so ask for JSON in the prompt and parse the text
+        cfg = types.GenerateContentConfig(temperature=temperature)
+        prompt = PROMPT + "\nReturn ONLY one JSON object (no markdown, no explanation) of this shape:\n" + json.dumps(SCHEMA["properties"], ensure_ascii=False)
+    else:
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json", response_schema=SCHEMA, temperature=temperature)
+        prompt = PROMPT
     delay = 15
     for attempt in range(max_retries):
         try:
-            r = client.models.generate_content(model=model, contents=parts + [PROMPT], config=cfg)
-            return json.loads(r.text)
+            r = client.models.generate_content(model=model, contents=parts + [prompt], config=cfg)
+            return parse_json_text(r.text) if gemma else json.loads(r.text)
         except Exception as e:  # noqa
             msg = str(e)
             low = msg.lower()
+            if "403" in msg or "permission_denied" in low or "api key not valid" in low or "api_key_invalid" in low:
+                sys.exit("\nGemini refused this key/account (permission problem) - retrying will not help:\n" + msg +
+                         "\n\nFix: use a key from a project/account where the Gemini API free tier is enabled and available in your region, or enable billing.")
             if "429" in msg or "resource_exhausted" in low or "quota" in low:
                 if "per day" in low or "perday" in low.replace(" ", "") or "daily" in low:
                     raise QuotaExhausted(msg)
@@ -209,7 +255,7 @@ def read_page(client, types, args, img, is_last=False):
     if not res.get("voters") and not is_last:
         print("   no voters found, re-reading once ...", flush=True)
         res = call_gemini(client, types, args.model, [img], temperature=0.4)
-    for mdl, temp in [(args.model, 0.4), (args.model, 0.8), (args.fallback_model or args.model, 0.3)]:
+    for mdl, temp in [(args.model, 0.4), (args.model, 0.8), (args.fallback_model or args.model, 0.3)][:args.rereads]:
         if not page_bad(res):
             break
         print("   non-Gujarati letters found, re-reading page ...", flush=True)
@@ -222,7 +268,7 @@ def get_client():
     from google.genai import types
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
-        sys.exit("Set GEMINI_API_KEY first (free key: https://aistudio.google.com/apikey)")
+        return None, types       # fine for local (ollama:) models; Gemini calls will fail without a key
     return genai.Client(api_key=key), types
 
 
@@ -357,6 +403,7 @@ if __name__ == "__main__":
     ap.add_argument("--rpm", type=float, default=10, help="requests per minute limit")
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--fallback-model", default="", help="stronger model used only to re-read pages with bad letters, e.g. gemini-3.5-flash")
+    ap.add_argument("--rereads", type=int, default=2, help="max re-reads of a page that has non-Gujarati letters (each costs 1 request)")
     ap.add_argument("--ward-map", default="")
     ap.add_argument("--skip-existing", action="store_true", help="skip PDFs whose Excel already exists")
     ap.add_argument("--cache", default="")
@@ -385,6 +432,8 @@ if __name__ == "__main__":
     client = types = None
     if not a.build_only:
         client, types = get_client()
+        if client is None and not a.model.startswith("ollama:"):
+            sys.exit("Set GEMINI_API_KEY first (free key: https://aistudio.google.com/apikey)")
     done, incomplete = [], []
     stopped = False
     for i, pdf in enumerate(pdfs, 1):
